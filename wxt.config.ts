@@ -1,9 +1,33 @@
 import { defineConfig } from "wxt";
 
+// ffmpeg.wasm 写文件时会 transfer ArrayBuffer。Windows 的扩展页面里，对端因此收到 undefined。
+function ffmpegNoTransfer() {
+  return {
+    name: "ffmpeg-no-transfer",
+    transform(code: string, id: string) {
+      if (!id.includes("@ffmpeg/ffmpeg") || !id.includes("classes.js")) return;
+      const from = `if (data instanceof Uint8Array) {
+            trans.push(data.buffer);
+        }
+        return this.#send({
+            type: FFMessageType.WRITE_FILE,
+            data: { path, data },
+        }, trans, signal);`;
+      const to = `return this.#send({
+            type: FFMessageType.WRITE_FILE,
+            data: { path, data },
+        }, [], signal);`;
+      if (!code.includes(from)) throw new Error("ffmpeg writeFile 源码变了，Windows 补丁没有打上");
+      return code.replace(from, to);
+    },
+  };
+}
+
 export default defineConfig({
   srcDir: ".",
   // 不用默认的 .output：Chrome「加载已解压的扩展程序」文件选择器不显示点开头的目录。
   outDir: "output",
+  vite: () => ({ plugins: [ffmpegNoTransfer()] }),
   manifest: {
     name: "视频下载",
     description: "嗅探当前页的视频和音频。直链直接保存，HLS 点播在本地封装成 MP4。",

@@ -4,8 +4,8 @@ const ROOT = "jobs";
 export async function writeJobFile(jobId: string, relativePath: string, data: BufferSource): Promise<void> {
   const file = await fileHandle(jobId, relativePath, true);
   const writable = await file.createWritable();
-  // 直接把 ArrayBuffer 视图交给 write()，有的环境下内部会去读一个已经空掉的 buffer。
-  await writable.write(copyBytes(data));
+  // Windows 上把 Blob 交给 OPFS 的 write() 会在内部读到空对象。写入一份独立的 ArrayBuffer。
+  await writable.write(ownedBuffer(data));
   await writable.close();
 }
 
@@ -31,12 +31,13 @@ export async function deleteJobFiles(jobId: string): Promise<void> {
   }
 }
 
-function copyBytes(data: BufferSource): Blob {
-  if (data instanceof ArrayBuffer) return new Blob([data]);
-  const view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+function ownedBuffer(data: BufferSource): ArrayBuffer {
+  const view = data instanceof ArrayBuffer
+    ? new Uint8Array(data)
+    : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   const copy = new ArrayBuffer(view.byteLength);
   new Uint8Array(copy).set(view);
-  return new Blob([copy]);
+  return copy;
 }
 
 async function fileHandle(jobId: string, relativePath: string, create: boolean): Promise<FileSystemFileHandle> {
