@@ -1,0 +1,27 @@
+{
+  "name": "chrome-video-downloader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip",
+    "test": "vitest run",
+    "postinstall": "node scripts/copy-ffmpeg.mjs",
+    "prepare:wxt": "wxt prepare"
+  },
+  "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2"
+  },
+  "devDependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@types/chrome": "^0.3.5",
+    "esbuild": "^0.27.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "wxt": "^0.20.13"
+  }
+}
