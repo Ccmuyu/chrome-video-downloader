@@ -146,7 +146,8 @@ function render(state: PopupState, favicon?: string): void {
 }
 
 function shell(options: { title: string; host: string; favicon?: string; count?: number; enabled: boolean; clearable?: boolean; body: string }): string {
-  const logo = chrome.runtime.getURL("icon/32.png");
+  const logo = chrome.runtime.getURL("icon/mark-32.png");
+  const logoDense = chrome.runtime.getURL("icon/mark-128.png");
   const favicon = options.favicon
     ? `<img class="favicon" src="${escapeHtml(options.favicon)}" alt="">`
     : "";
@@ -155,7 +156,7 @@ function shell(options: { title: string; host: string; favicon?: string; count?:
   const checked = options.enabled ? "true" : "false";
   return `<div class="shell">
     <header class="top">
-      <img class="logo" src="${logo}" alt="" width="28" height="28">
+      <img class="logo" src="${logo}" srcset="${logo} 1x, ${logoDense} 2x" alt="" width="28" height="28">
       <div class="brand">
         <div class="name">${escapeHtml(options.title)}</div>
         <div class="site">${favicon}<span>${escapeHtml(options.host)}</span></div>

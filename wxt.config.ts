@@ -22,8 +22,20 @@ export default defineConfig({
     // host_permissions 必须留空：WXT 看到 content script 入口且 matches 为全站时，会自动写成 *://*/*。
     optional_host_permissions: ["http://*/*", "https://*/*"],
     host_permissions: [],
+    icons: {
+      16: "icon/mark-16.png",
+      32: "icon/mark-32.png",
+      48: "icon/mark-48.png",
+      128: "icon/mark-128.png",
+    },
     action: {
       default_title: "视频下载",
+      default_icon: {
+        16: "icon/mark-16.png",
+        32: "icon/mark-32.png",
+        48: "icon/mark-48.png",
+        128: "icon/mark-128.png",
+      },
     },
     content_security_policy: {
       // ffmpeg.wasm 在 offscreen 里编译 WebAssembly，默认 CSP 会拦住。

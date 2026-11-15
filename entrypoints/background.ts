@@ -86,6 +86,15 @@ async function boot(): Promise<void> {
   await syncInjections();
   await syncWebRequest();
   await chrome.action.setTitle({ title: (await isEnabled()) ? "视频下载" : "视频下载（已关闭）" });
+  // 清单里的图标路径换了之后，再设一次，工具栏不会继续显示换图前的缓存。
+  await chrome.action.setIcon({
+    path: {
+      16: "icon/mark-16.png",
+      32: "icon/mark-32.png",
+      48: "icon/mark-48.png",
+      128: "icon/mark-128.png",
+    },
+  });
 }
 
 let webRequestQueue: Promise<void> = Promise.resolve();
