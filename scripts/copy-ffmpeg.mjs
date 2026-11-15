@@ -30,23 +30,6 @@ await esbuild.build({
 });
 
 const workerPath = join(out, "worker.js");
-let worker = await readFile(workerPath, "utf8");
+const worker = await readFile(workerPath, "utf8");
 // worker 默认把核心指到 unpkg。清空后，没传 coreURL 会失败，而不是在运行时去外网拉 wasm。
-worker = worker.replace(/https:\/\/unpkg\.com[^`'"]*/g, "");
-// Windows 上把 ArrayBuffer 放进 transfer 列表，对端会收到 undefined，接着读 .buffer 就抛
-// Cannot read properties of undefined。改成结构化克隆，两边都拿到完整字节。
-const transfer = `if (data instanceof Uint8Array) {
-    trans.push(data.buffer);
-  }
-  self.postMessage({ id, type, data }, trans);`;
-const cloned = `self.postMessage({ id, type, data });`;
-if (!worker.includes(transfer)) throw new Error("ffmpeg worker 里找不到 ArrayBuffer transfer，无法打上 Windows 补丁");
-worker = worker.replace(transfer, cloned);
-worker = worker.replace(
-  `var writeFile = ({ path, data }) => {
-  ffmpeg.FS.writeFile(path, data);`,
-  `var writeFile = ({ path, data }) => {
-  if (data == null) throw new Error("封装器没有收到分片数据");
-  ffmpeg.FS.writeFile(path, data);`,
-);
-await writeFile(workerPath, worker);
+await writeFile(workerPath, worker.replace(/https:\/\/unpkg\.com[^`'"]*/g, ""));

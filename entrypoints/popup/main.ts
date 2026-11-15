@@ -187,9 +187,6 @@ function card(item: SniffedMedia, jobs: DownloadJob[]): string {
   const job = [...related].reverse().find((entry) => entry.state !== "done" && entry.state !== "cancelled") ?? related.at(-1);
   const line = subtitle(item, job);
   const disabled = Boolean(item.unsupportedReason) || Boolean(job && active(job));
-  const origins = job?.needOrigins?.length
-    ? job.needOrigins
-    : notice?.mediaId === item.id ? notice.origins : undefined;
   return `<article class="row${item.unsupportedReason ? " is-disabled" : ""}">
     <div class="row-main">
       <span class="badge badge-${item.kind}">${kindLabel(item.kind)}</span>
@@ -201,7 +198,6 @@ function card(item: SniffedMedia, jobs: DownloadJob[]): string {
     </div>
     ${job && (job.state === "fetching" || job.state === "muxing" || job.state === "saving") ? progressBar(job) : ""}
     ${picker?.mediaId === item.id ? qualityPicker(item.id, picker.variants) : ""}
-    ${origins?.length ? `<button class="btn warn" type="button" data-origins="${escapeHtml(origins.join(" "))}">授权 ${escapeHtml(origins.map(prettyOrigin).join("、"))}</button>` : ""}
   </article>`;
 }
 
@@ -248,7 +244,7 @@ function bind(state: PopupState): void {
   document.querySelectorAll<HTMLButtonElement>("[data-download]").forEach((button) => {
     button.addEventListener("click", () => {
       const media = state.items.find((item) => item.id === button.dataset.download);
-      if (media) void begin(media);
+      if (media) void begin(media, state.jobs);
     });
   });
   document.querySelectorAll<HTMLButtonElement>("[data-pick]").forEach((button) => {
@@ -256,7 +252,7 @@ function bind(state: PopupState): void {
       const media = state.items.find((item) => item.id === button.dataset.pick);
       const current = picker;
       const variant = current && current.mediaId === media?.id ? current.variants[Number(button.dataset.index)] : undefined;
-      if (media && variant) void start(media, variant.uri);
+      if (media && variant) void start(media, variant.uri, state.jobs);
     });
   });
   document.querySelectorAll<HTMLButtonElement>("[data-cancel]").forEach((button) => {
@@ -278,27 +274,35 @@ function bind(state: PopupState): void {
   document.querySelector<HTMLButtonElement>("#clear")?.addEventListener("click", () => {
     if (state.tabId != null) void removeAll(state.tabId);
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-origins]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const origins = (button.dataset.origins ?? "").split(" ").filter(Boolean);
-      void grantOrigins(origins);
-    });
-  });
 }
 
 // 直链立即开始。HLS 先解析：多档清晰度展开选项，再点某一档才 START。再点下载按钮收起选项。
-async function begin(media: SniffedMedia): Promise<void> {
-  notice = null;
+// chrome.permissions.request 必须在这次点击的调用栈里发出。先 await 消息再申请，浏览器会直接拒绝，弹不出授权。
+async function begin(media: SniffedMedia, jobs: DownloadJob[]): Promise<void> {
   if (picker?.mediaId === media.id) {
     picker = null;
+    notice = null;
     await refresh();
     return;
   }
+  const patterns = patternsFor(media, jobs);
+  const grant = await askOrigins(patterns);
+  notice = null;
+  if (!grant.ok) {
+    notice = { mediaId: media.id, text: accessHint(patterns, true), origins: patterns };
+    await refresh();
+    return;
+  }
+  if (grant.fresh) await chrome.runtime.sendMessage({ type: "INJECT" }).catch(() => undefined);
   if (media.kind === "file") {
     await start(media);
     return;
   }
   if (media.kind === "dash") return;
+  await resolveAndStart(media, 0);
+}
+
+async function resolveAndStart(media: SniffedMedia, attempt: number): Promise<void> {
   busyMedia = media.id;
   await refresh();
   const result = (await chrome.runtime.sendMessage({ type: "RESOLVE", mediaId: media.id })) as {
@@ -310,8 +314,23 @@ async function begin(media: SniffedMedia): Promise<void> {
   };
   busyMedia = null;
   if (!result.ok) {
-    notice = { mediaId: media.id, text: result.error || "无法读取播放列表", origins: result.needOrigins };
-    if (result.needOrigins?.length) notice.text = `需要授权 CDN：${result.needOrigins.map(prettyOrigin).join("、")}`;
+    // 播放列表里的分片可能在另一个域名。这次申请已经离开点击调用栈，经常弹不出来；
+    // 弹不出来就只留一句提示，下次点击会把这些域名带上，那时才能弹出授权。最多再试三次，避免同一域名来回请求。
+    if (result.needOrigins?.length && attempt < 3) {
+      const grant = await askOrigins(result.needOrigins);
+      if (grant.ok) {
+        if (grant.fresh) await chrome.runtime.sendMessage({ type: "INJECT" }).catch(() => undefined);
+        return resolveAndStart(media, attempt + 1);
+      }
+      notice = {
+        mediaId: media.id,
+        text: accessHint(result.needOrigins, false),
+        origins: result.needOrigins,
+      };
+      await refresh();
+      return;
+    }
+    notice = { mediaId: media.id, text: result.error || "无法读取播放列表" };
     await refresh();
     return;
   }
@@ -324,7 +343,18 @@ async function begin(media: SniffedMedia): Promise<void> {
   await start(media, only);
 }
 
-async function start(media: SniffedMedia, variantUri?: string): Promise<void> {
+async function start(media: SniffedMedia, variantUri?: string, jobs?: DownloadJob[]): Promise<void> {
+  if (jobs && variantUri) {
+    const patterns = patternsFor(media, jobs, variantUri);
+    const grant = await askOrigins(patterns);
+    notice = null;
+    if (!grant.ok) {
+      notice = { mediaId: media.id, text: accessHint(patterns, true), origins: patterns };
+      await refresh();
+      return;
+    }
+    if (grant.fresh) await chrome.runtime.sendMessage({ type: "INJECT" }).catch(() => undefined);
+  }
   notice = null;
   const result = (await chrome.runtime.sendMessage({ type: "START", mediaId: media.id, variantUri })) as {
     ok: boolean;
@@ -333,6 +363,36 @@ async function start(media: SniffedMedia, variantUri?: string): Promise<void> {
   if (!result.ok) notice = { mediaId: media.id, text: result.error || "没能开始下载" };
   else picker = null;
   await refresh();
+}
+
+// 必须在点击调用栈里同步调用，不能先 await。已经允许的来源不会再弹窗。
+// contains 和 request 一起发出：先等 contains 再 request 会丢掉这次点击。
+// fresh 表示这次是新允许的。只有那时才重新注入页面脚本，避免每次下载都把脚本再插一遍。
+function askOrigins(patterns: Array<string | null | undefined>): Promise<{ ok: boolean; fresh: boolean }> {
+  const origins = [...new Set(patterns.filter((item): item is string => Boolean(item)))];
+  if (origins.length === 0) return Promise.resolve({ ok: true, fresh: false });
+  const already = chrome.permissions.contains({ origins });
+  const requested = chrome.permissions.request({ origins }).catch(() => false);
+  return Promise.all([already, requested]).then(([hadAll, ok]) => ({ ok, fresh: ok && !hadAll }));
+}
+
+// 这次点击能确定的来源：当前地址、选中的清晰度，以及上次没允许的 CDN。后两类要带上，否则第二次点击仍不知道该问谁。
+function patternsFor(media: SniffedMedia, jobs: DownloadJob[], extraUrl?: string): string[] {
+  const remembered = notice?.mediaId === media.id ? notice.origins ?? [] : [];
+  const pending = [...jobs].reverse().find((job) => job.mediaId === media.id && job.needOrigins?.length);
+  const values = [extraUrl, media.url, ...remembered, ...(pending?.needOrigins ?? [])];
+  const origins: string[] = [];
+  for (const value of values) {
+    const pattern = value ? originPattern(value) : null;
+    if (pattern && !origins.includes(pattern)) origins.push(pattern);
+  }
+  return origins;
+}
+
+function accessHint(patterns: string[], denied: boolean): string {
+  const hosts = patterns.map(prettyOrigin).filter(Boolean).join("、");
+  if (!hosts) return denied ? "未允许访问，无法下载" : "再点一次下载，以允许访问";
+  return denied ? `未允许访问 ${hosts}` : `再点一次下载，以允许访问 ${hosts}`;
 }
 
 async function removeOne(mediaId: string): Promise<void> {
@@ -357,15 +417,6 @@ async function grant(pageUrl: string): Promise<void> {
   const ok = await chrome.permissions.request({ origins: [pattern] });
   if (!ok) return;
   await chrome.runtime.sendMessage({ type: "INJECT" });
-  await refresh();
-}
-
-async function grantOrigins(origins: string[]): Promise<void> {
-  if (origins.length === 0) return;
-  const ok = await chrome.permissions.request({ origins });
-  if (!ok) return;
-  await chrome.runtime.sendMessage({ type: "INJECT" });
-  notice = null;
   await refresh();
 }
 
@@ -398,13 +449,16 @@ function statusText(job: DownloadJob): string {
   if (job.state === "saving") return `${prefix}正在保存`;
   if (job.state === "done") return job.filename ? `已保存 ${job.filename}` : "已保存";
   if (job.state === "cancelled") return "已取消";
-  if (job.state === "failed") return job.error || "下载失败";
+  if (job.state === "failed") {
+    if (job.needOrigins?.length) return `再点一次下载，以允许访问 ${job.needOrigins.map(prettyOrigin).join("、")}`;
+    return job.error || "下载失败";
+  }
   return "排队中";
 }
 
 function subtitle(item: SniffedMedia, job: DownloadJob | undefined): { text: string; klass: string } {
   if (job && active(job)) return { text: statusText(job), klass: "" };
-  if (job?.state === "failed") return { text: job.error || noticeText(item) || "下载失败", klass: "bad" };
+  if (job?.state === "failed") return { text: statusText(job), klass: "bad" };
   if (job?.state === "done") return { text: job.filename ? `已保存 ${job.filename}` : "已保存", klass: "good" };
   if (job?.state === "cancelled") return { text: "已取消", klass: "" };
   if (item.unsupportedReason) return { text: item.unsupportedReason, klass: "bad" };

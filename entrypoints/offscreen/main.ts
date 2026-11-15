@@ -7,13 +7,14 @@ let port: chrome.runtime.Port;
 let ffmpeg: FFmpeg | null = null;
 let logs: string[] = [];
 let activeJobId: string | null = null;
-let activeDownloadId: number | null = null;
 
 function connect(): void {
   port = chrome.runtime.connect({ name: "offscreen" });
-  port.onMessage.addListener((message: { type?: string; jobId?: string; filename?: string }) => {
+  port.onMessage.addListener((message: { type?: string; jobId?: string; filename?: string; url?: string }) => {
     if (message.type === "MUX" && message.jobId) void runMux(message.jobId, message.filename);
     if (message.type === "MUX_CANCEL" && message.jobId === activeJobId) void cancelActive();
+    // 后台保存完再收回地址。这里没有 chrome.downloads，不能自己触发下载。
+    if (message.type === "REVOKE_URL" && message.url?.startsWith("blob:")) URL.revokeObjectURL(message.url);
   });
   port.onDisconnect.addListener(() => {
     window.setTimeout(connect, 200);
@@ -52,13 +53,21 @@ async function runMux(jobId: string, filename: string | undefined): Promise<void
     engine.terminate();
     ffmpeg = null;
     tell({ type: "MUX_SAVING", jobId });
-    await saveFile(filename || manifest.filename, bytes);
-    tell({ type: "MUX_DONE", jobId });
+    // chrome.offscreen 创建的文档没有 chrome.downloads，直接调用会抛
+    // Cannot read properties of undefined (reading 'download')。
+    // 普通扩展页打开同一地址却有这个接口，不能用那种页面的结果判断这里。
+    tell({
+      type: "MUX_FILE",
+      jobId,
+      url: objectUrl(bytes),
+      filename: filename || manifest.filename,
+    });
   } catch (error) {
     tell({ type: "MUX_ERROR", jobId, error: errorText(error).slice(0, 80) });
     ffmpeg?.terminate();
     ffmpeg = null;
   } finally {
+    // 封装器已经停了。取消正在保存的文件靠后台记下的下载号，不靠这里的任务号。
     if (activeJobId === jobId) activeJobId = null;
   }
 }
@@ -163,48 +172,17 @@ function errorText(error: unknown): string {
   return "封装失败";
 }
 
-async function saveFile(filename: string, bytes: Uint8Array): Promise<void> {
+function objectUrl(bytes: Uint8Array): string {
   // ffmpeg 读出的是 Uint8Array<ArrayBufferLike>，不能直接当 BlobPart。拷进一份新的 ArrayBuffer。
   const copy = new ArrayBuffer(bytes.byteLength);
   new Uint8Array(copy).set(bytes);
-  const blob = new Blob([copy], { type: "video/mp4" });
-  const url = URL.createObjectURL(blob);
-  try {
-    const downloadId = await chrome.downloads.download({
-      url,
-      filename,
-      conflictAction: "uniquify",
-      saveAs: false,
-    });
-    activeDownloadId = downloadId;
-    await waitForDownload(downloadId);
-  } finally {
-    activeDownloadId = null;
-    setTimeout(() => URL.revokeObjectURL(url), 120_000);
-  }
+  const url = URL.createObjectURL(new Blob([copy], { type: "video/mp4" }));
+  // 下载完成前不能回收，否则浏览器还没把字节写进文件。后台会在结束后通知回收；这里只防它没通知。
+  setTimeout(() => URL.revokeObjectURL(url), 30 * 60_000);
+  return url;
 }
 
-function waitForDownload(id: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const onChanged = (delta: chrome.downloads.DownloadDelta) => {
-      if (delta.id !== id || !delta.state) return;
-      if (delta.state.current === "complete") {
-        chrome.downloads.onChanged.removeListener(onChanged);
-        resolve();
-      } else if (delta.state.current === "interrupted") {
-        chrome.downloads.onChanged.removeListener(onChanged);
-        reject(new Error("浏览器没能保存文件"));
-      }
-    };
-    chrome.downloads.onChanged.addListener(onChanged);
-  });
-}
-
-async function cancelActive(): Promise<void> {
-  if (activeDownloadId != null) {
-    await chrome.downloads.cancel(activeDownloadId).catch(() => undefined);
-    activeDownloadId = null;
-  }
+function cancelActive(): void {
   ffmpeg?.terminate();
   ffmpeg = null;
 }

@@ -73,8 +73,11 @@ type Incoming =
 
 type OffscreenMessage =
   | { type: "MUX_SAVING"; jobId: string }
+  | { type: "MUX_FILE"; jobId: string; url: string; filename: string }
   | { type: "MUX_DONE"; jobId: string }
   | { type: "MUX_ERROR"; jobId: string; error: string };
+
+let muxDownloadId: number | null = null;
 
 async function boot(): Promise<void> {
   // Service Worker 会被回收。上次的会话规则和进行中的任务都不能接着用。
@@ -193,6 +196,11 @@ async function onMessage(message: Incoming, sender: chrome.runtime.MessageSender
     }
     case "CANCEL":
       await cancelJob(message.jobId);
+      // 封装结束后文件还在下载。这时离屏页的任务号已经清空，只能在这里取消。
+      if (muxDownloadId != null) {
+        await chrome.downloads.cancel(muxDownloadId).catch(() => undefined);
+        muxDownloadId = null;
+      }
       offscreenPort?.postMessage({ type: "MUX_CANCEL", jobId: message.jobId });
       return { ok: true };
     case "DISMISS":
@@ -457,9 +465,64 @@ async function onOffscreenMessage(message: OffscreenMessage): Promise<void> {
   }
   const waiter = muxWaiters.get(message.jobId);
   if (!waiter) return;
+  if (message.type === "MUX_FILE") {
+    // 先拿走等待者，避免下载期间又来一条消息把同一次封装结算两次。
+    muxWaiters.delete(message.jobId);
+    try {
+      await downloadBlob(message.url, message.filename);
+      waiter.resolve();
+    } catch (error) {
+      waiter.reject(error instanceof Error ? error : new Error("浏览器没能保存文件"));
+    } finally {
+      offscreenPort?.postMessage({ type: "REVOKE_URL", url: message.url });
+    }
+    return;
+  }
   muxWaiters.delete(message.jobId);
   if (message.type === "MUX_DONE") waiter.resolve();
   if (message.type === "MUX_ERROR") waiter.reject(new Error(message.error || "封装失败"));
+}
+
+// 离屏文档没有 chrome.downloads。blob 地址由它生成，下载必须在后台发起。
+// 下载管理器在浏览器进程里读这个地址，所以跨得过离屏页和服务工作线程。
+function downloadBlob(url: string, filename: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let currentId: number | null = null;
+    let onChanged: ((delta: chrome.downloads.DownloadDelta) => void) | null = null;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (currentId != null && muxDownloadId === currentId) muxDownloadId = null;
+      if (onChanged) chrome.downloads.onChanged.removeListener(onChanged);
+      if (error) reject(error);
+      else resolve();
+    };
+    chrome.downloads.download({
+      url,
+      filename: filename || "video.mp4",
+      conflictAction: "uniquify",
+      saveAs: false,
+    }).then((downloadId) => {
+      currentId = downloadId;
+      muxDownloadId = downloadId;
+      onChanged = (delta) => {
+        if (delta.id !== downloadId || !delta.state) return;
+        if (delta.state.current === "complete") finish();
+        else if (delta.state.current === "interrupted") finish(new Error("浏览器没能保存文件"));
+      };
+      chrome.downloads.onChanged.addListener(onChanged);
+      // 很小的文件可能在监听加上之前就下完了，所以再查一次当前状态。
+      void chrome.downloads.search({ id: downloadId }).then((items) => {
+        const item = items[0];
+        if (!item) return;
+        if (item.state === "complete") finish();
+        else if (item.state === "interrupted") finish(new Error("浏览器没能保存文件"));
+      });
+    }, () => {
+      finish(new Error("浏览器没能保存文件"));
+    });
+  });
 }
 
 async function ensureOffscreen(): Promise<void> {
